@@ -1,0 +1,95 @@
+# Lakeflow Job definition for the medallion pipeline.
+
+resources:
+  jobs:
+    p1_medallion_daily:
+      name: p1-medallion-daily
+      max_concurrent_runs: 1
+      timeout_seconds: 7200
+      email_notifications:
+        on_failure:
+        - <your-email>
+        no_alert_for_skipped_runs: false
+      schedule:
+        quartz_cron_expression: "0 30 2 * * ?"
+        timezone_id: Asia/Kolkata
+        pause_status: PAUSED
+      job_clusters:
+      - job_cluster_key: p1_shared
+        new_cluster:
+          spark_version: "17.3.x-scala2.13"
+          node_type_id: Standard_D2ads_v6
+          num_workers: 0
+          data_security_mode: SINGLE_USER
+          single_user_name: <your-workspace-user>
+          spark_conf:
+            spark.master: "local[*, 4]"
+            spark.databricks.cluster.profile: singleNode
+          custom_tags:
+            ResourceClass: SingleNode
+          azure_attributes:
+            availability: ON_DEMAND_AZURE
+            first_on_demand: 1
+      tasks:
+      - task_key: bronze_batch
+        description: 'ADLS raw -> retail.bronze.orders / customers. Both writes use mode=overwrite,
+          so a re-run produces the same tables. demo_mode=false skips the time-travel cells, which
+          write to Bronze for demonstration.'
+        job_cluster_key: p1_shared
+        notebook_task:
+          notebook_path: ./notebooks/01_bronze_ingest
+          source: WORKSPACE
+          base_parameters:
+            demo_mode: 'false'
+        timeout_seconds: 1800
+        max_retries: 1
+        min_retry_interval_millis: 60000
+        retry_on_timeout: true
+      - task_key: bronze_stream
+        description: 'Auto Loader landing/orders -> retail.bronze.orders_stream. 2 retries:
+          addNewColumns fails once by design on a new column and self-heals on restart. Not wired
+          into silver because silver does not read this table.'
+        job_cluster_key: p1_shared
+        notebook_task:
+          notebook_path: ./notebooks/04_autoloader
+          source: WORKSPACE
+        timeout_seconds: 1800
+        max_retries: 2
+        min_retry_interval_millis: 300000
+        retry_on_timeout: true
+      - task_key: silver
+        description: Typing, status normalisation, quality split, MERGE upsert, SCD2 dim_customer.
+        depends_on:
+        - task_key: bronze_batch
+        job_cluster_key: p1_shared
+        notebook_task:
+          notebook_path: ./notebooks/02_silver
+          source: WORKSPACE
+        timeout_seconds: 1800
+        max_retries: 1
+        min_retry_interval_millis: 60000
+      - task_key: gold
+        description: 'Daily and customer revenue aggregates, with a three-way reconciliation check.
+          max_retries 0: a gold failure is deterministic and will fail identically on a retry.'
+        depends_on:
+        - task_key: silver
+        job_cluster_key: p1_shared
+        notebook_task:
+          notebook_path: ./notebooks/03_gold
+          source: WORKSPACE
+        timeout_seconds: 1800
+        max_retries: 0
+      - task_key: stateful_revenue
+        description: Windowed revenue with an event-time watermark, plus a stream-static join on
+          dim_customer, which is why it depends on silver.
+        depends_on:
+        - task_key: silver
+        job_cluster_key: p1_shared
+        notebook_task:
+          notebook_path: ./notebooks/05_stateful
+          source: WORKSPACE
+        timeout_seconds: 1800
+        max_retries: 1
+        min_retry_interval_millis: 60000
+      queue:
+        enabled: true
